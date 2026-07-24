@@ -1,0 +1,35 @@
+export interface AppDetails {
+  packageName: string;
+  url: string;
+  title: string;
+  summary: string;
+  description: string;
+  icon: string;
+  headerImage: string | null;
+  screenshots: string[];
+  developer: string;
+  developerId: string;
+  developerWebsite: string | null;
+  category: string;
+  categoryId: string | null;
+  version: string;
+  installs: string;
+  minInstalls: number;
+  maxInstalls: number;
+  score: number;
+  scoreText: string;
+  ratings: number;
+  reviewsCount: number;
+  histogram: Record<'1' | '2' | '3' | '4' | '5', number>;
+  free: boolean;
+  price: number;
+  priceText: string;
+  currency: string;
+  size: string;
+  androidVersion: string;
+  contentRating: string;
+  adSupported: boolean;
+  released: string | null;
+  updated: string | null;
+  recentChanges: string | null;
+}
