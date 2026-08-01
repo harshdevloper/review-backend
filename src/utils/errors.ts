@@ -10,7 +10,7 @@ const SUGGESTIONS: Record<ErrorCode, string> = {
   INVALID_URL:
     'Paste a full Google Play Store app URL, e.g. https://play.google.com/store/apps/details?id=com.whatsapp',
   APP_NOT_FOUND:
-    'Double-check the app is still published on the Play Store and the URL points to a valid app id.',
+    'Double-check the app id. If the app is published in only a few countries, add that storefront to the URL, e.g. &gl=in.',
   SCRAPE_FAILED:
     'Google Play may be temporarily unavailable. Wait a few seconds and try again.',
   RATE_LIMITED:

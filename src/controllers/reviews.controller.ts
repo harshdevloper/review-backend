@@ -24,10 +24,12 @@ async function performFetch(
   onStage('connecting', 'Connecting to Google Play...', 8);
 
   onStage('app-details', 'Fetching application details...', 20);
-  const app = await fetchAppDetails(packageName, lang, country);
+  // the listing may resolve in a different storefront than requested (region-locked apps), and the
+  // reviews have to be pulled from that same one
+  const { app, country: resolvedCountry } = await fetchAppDetails(packageName, lang, country);
 
   onStage('downloading-reviews', 'Downloading reviews...', 30, 0);
-  const reviews = await fetchReviews(packageName, lang, country, (count) => {
+  const reviews = await fetchReviews(packageName, lang, resolvedCountry, (count) => {
     const progress = 30 + Math.min(count / env.maxReviews, 1) * 50;
     onStage('downloading-reviews', `Downloading reviews... (${count} fetched)`, progress, count);
   });

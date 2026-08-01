@@ -17,5 +17,5 @@ export const env = {
   port: Number(process.env.PORT ?? 4000),
   clientOrigins: [...new Set([...DEFAULT_ORIGINS, ...envOrigins])],
   cacheTtlMinutes: Number(process.env.CACHE_TTL_MINUTES ?? 30),
-  maxReviews: Number(process.env.MAX_REVIEWS ?? 2000),
+  maxReviews: Number(process.env.MAX_REVIEWS ?? 10000),
 };
