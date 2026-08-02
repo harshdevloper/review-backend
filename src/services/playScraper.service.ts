@@ -8,10 +8,19 @@ import type { Review, Sentiment } from '../types/review.types.js';
 // Google caps a review page at ~150 entries no matter what `num` asks for, so reaching 10k takes
 // roughly 67 round trips.
 const REVIEWS_PER_PAGE = 200;
-// google-play-scraper's .d.ts mistypes `gplay.sort` as the enum's value type
-// instead of its namespace, so `gplay.sort.NEWEST` doesn't type-check. The
-// enum itself declares NEWEST = 2 — use that literal instead.
-const SORT_NEWEST = 2;
+// google-play-scraper's .d.ts mistypes `gplay.sort` as the enum's value type instead of its
+// namespace, so `gplay.sort.NEWEST` doesn't type-check. The enum declares HELPFULNESS = 1,
+// NEWEST = 2, RATING = 3 — use those literals instead.
+//
+// Each sort order is its own paginated feed and they barely overlap: fetching only NEWEST shares
+// 0% of its results with HELPFULNESS, which is what the Play Store page itself shows by default —
+// so a newest-only fetch looks nothing like the store listing. Walking every order and merging on
+// review id both matches what users see and reaches far more reviews than any single feed.
+const REVIEW_SORTS = [
+  { name: 'relevant', value: 1 },
+  { name: 'newest', value: 2 },
+  { name: 'rating', value: 3 },
+];
 // Requesting those pages back-to-back gets the connection torn down (ECONNRESET) after ~15 of
 // them, which is what capped deep fetches. Pausing briefly between pages sustains the full run;
 // the retry is a safety net for resets that still slip through.
@@ -27,6 +36,7 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const FALLBACK_COUNTRIES = ['us', 'in', 'br', 'id', 'jp', 'de', 'gb', 'ng'];
 
 type PlayApp = Awaited<ReturnType<typeof gplay.app>>;
+type PlayReview = Awaited<ReturnType<typeof gplay.reviews>>['data'][number];
 
 function statusOf(error: unknown): number | undefined {
   return (error as { status?: number } | undefined)?.status;
@@ -133,7 +143,9 @@ async function fetchReviewPage(
   packageName: string,
   lang: string,
   country: string,
+  sort: number,
   token: string | undefined,
+  deadline: number,
 ) {
   for (let attempt = 0; ; attempt++) {
     try {
@@ -141,7 +153,7 @@ async function fetchReviewPage(
         appId: packageName,
         lang,
         country,
-        sort: SORT_NEWEST,
+        sort,
         num: REVIEWS_PER_PAGE,
         paginate: true,
         nextPaginationToken: token,
@@ -149,55 +161,126 @@ async function fetchReviewPage(
     } catch (error) {
       // a 404 mid-pagination is terminal; resets and rate limits are worth backing off for
       if (attempt >= MAX_PAGE_RETRIES || statusOf(error) === 404) throw error;
-      await sleep(1000 * 2 ** attempt);
+      const backoff = 1000 * 2 ** attempt;
+      // never let a backoff run past the caller's wall clock — on a short budget the last retry
+      // would otherwise overshoot it by more than it could earn back
+      if (Date.now() + backoff >= deadline) throw error;
+      await sleep(backoff);
     }
   }
+}
+
+function toReview(item: PlayReview, lang: string): Review {
+  const text = item.text ?? '';
+  return {
+    id: item.id,
+    userName: item.userName,
+    userImage: item.userImage,
+    score: item.score,
+    title: item.title ?? null,
+    text,
+    date: item.date,
+    replyDate: item.replyDate ?? null,
+    replyText: item.replyText ?? null,
+    version: item.version ?? null,
+    thumbsUp: item.thumbsUp ?? 0,
+    language: detectLanguage(text, lang),
+    sentiment: scoreToSentiment(item.score),
+  };
+}
+
+/**
+ * Pulls only reviews that aren't stored yet. Google returns the NEWEST feed most-recent-first, so
+ * everything new sits at the front: page forward until a page contains nothing unknown, then stop.
+ * Catching up on a day of activity costs a couple of requests instead of a full re-scrape.
+ *
+ * `isKnown` reports which ids are already held; the walk tolerates a few pages that are entirely
+ * known before giving up, since the feed is not perfectly ordered near the boundary.
+ */
+export async function syncNewReviews(
+  packageName: string,
+  lang: string,
+  country: string,
+  findUnknown: (ids: string[]) => Promise<Set<string>>,
+  onBatch?: (batch: Review[]) => void,
+): Promise<Review[]> {
+  const SORT_NEWEST = 2;
+  const STOP_AFTER_KNOWN_PAGES = 2;
+  const deadline = env.fetchTimeoutMs > 0 ? Date.now() + env.fetchTimeoutMs : Infinity;
+
+  const fresh: Review[] = [];
+  let token: string | undefined;
+  let knownPages = 0;
+
+  for (;;) {
+    const page = await fetchReviewPage(packageName, lang, country, SORT_NEWEST, token, deadline);
+    if (page.data.length === 0) break;
+
+    const unknown = await findUnknown(page.data.map((item) => item.id));
+    if (unknown.size === 0) {
+      if (++knownPages >= STOP_AFTER_KNOWN_PAGES) break;
+    } else {
+      knownPages = 0;
+      const batch = page.data.filter((item) => unknown.has(item.id)).map((item) => toReview(item, lang));
+      fresh.push(...batch);
+      onBatch?.(batch);
+    }
+
+    token = page.nextPaginationToken;
+    if (!token || Date.now() >= deadline) break;
+    await sleep(PAGE_DELAY_MS);
+  }
+
+  return fresh;
 }
 
 export async function fetchReviews(
   packageName: string,
   lang: string,
   country: string,
-  onProgress?: (count: number) => void,
+  // `batch` carries only the reviews new to this page, so a consumer can stream results out as
+  // they land instead of waiting for the whole run to finish
+  onProgress?: (count: number, batch: Review[]) => void,
 ): Promise<Review[]> {
-  const collected: Review[] = [];
-  let token: string | undefined;
+  const byId = new Map<string, Review>();
+  const limit = env.maxReviews > 0 ? env.maxReviews : Infinity;
+  const deadline = env.fetchTimeoutMs > 0 ? Date.now() + env.fetchTimeoutMs : Infinity;
+  const budgetSpent = () => byId.size >= limit || Date.now() >= deadline;
 
-  try {
-    do {
-      const page = await fetchReviewPage(packageName, lang, country, token);
+  const walkSort = async (sort: number): Promise<void> => {
+    let token: string | undefined;
 
+    for (;;) {
+      const page = await fetchReviewPage(packageName, lang, country, sort, token, deadline);
+
+      const batch: Review[] = [];
       for (const item of page.data) {
-        const text = item.text ?? '';
-        collected.push({
-          id: item.id,
-          userName: item.userName,
-          userImage: item.userImage,
-          score: item.score,
-          title: item.title ?? null,
-          text,
-          date: item.date,
-          replyDate: item.replyDate ?? null,
-          replyText: item.replyText ?? null,
-          version: item.version ?? null,
-          thumbsUp: item.thumbsUp ?? 0,
-          language: detectLanguage(text, lang),
-          sentiment: scoreToSentiment(item.score),
-        });
+        if (byId.has(item.id)) continue;
+        const review = toReview(item, lang);
+        byId.set(item.id, review);
+        batch.push(review);
       }
 
       token = page.nextPaginationToken;
-      onProgress?.(collected.length);
+      onProgress?.(byId.size, batch);
 
-      if (token && collected.length < env.maxReviews) await sleep(PAGE_DELAY_MS);
-    } while (token && collected.length < env.maxReviews);
-  } catch (error) {
-    if (collected.length > 0) {
-      // partial results are still useful — surface what we have instead of failing the whole fetch
-      return collected.slice(0, env.maxReviews);
+      if (!token || budgetSpent()) return;
+      await sleep(PAGE_DELAY_MS);
     }
-    throw toAppError(error);
+  };
+
+  // The sort feeds are independent pagination chains, so walking them at the same time fits about
+  // 30% more reviews into the same wall clock. It is not 3x: Google throttles on total request
+  // rate, and dropping the per-chain delay to zero gets every request rejected outright — the
+  // delay is what keeps the whole thing alive, so it stays even when running concurrently.
+  const outcomes = await Promise.allSettled(REVIEW_SORTS.map(({ value }) => walkSort(value)));
+
+  // one feed running dry shouldn't lose what the others produced; only a total washout is an error
+  if (byId.size === 0) {
+    const failed = outcomes.find((outcome) => outcome.status === 'rejected');
+    throw toAppError(failed?.reason ?? new Error('Google Play returned no reviews for this app.'));
   }
 
-  return collected.slice(0, env.maxReviews);
+  const collected = [...byId.values()];
+  return limit === Infinity ? collected : collected.slice(0, limit);
 }
