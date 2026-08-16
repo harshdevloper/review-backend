@@ -5,22 +5,12 @@ import { AppError, toAppError } from '../utils/errors.js';
 import type { AppDetails } from '../types/app.types.js';
 import type { Review, Sentiment } from '../types/review.types.js';
 
-// Google caps a review page at ~150 entries no matter what `num` asks for, so reaching 10k takes
-// roughly 67 round trips.
-const REVIEWS_PER_PAGE = 200;
+// Google currently caps a review page at 150 entries. Asking for more does not make the page
+// larger, and makes the intended pagination contract less obvious.
+const REVIEWS_PER_PAGE = 150;
 // google-play-scraper's .d.ts mistypes `gplay.sort` as the enum's value type instead of its
-// namespace, so `gplay.sort.NEWEST` doesn't type-check. The enum declares HELPFULNESS = 1,
-// NEWEST = 2, RATING = 3 — use those literals instead.
-//
-// Each sort order is its own paginated feed and they barely overlap: fetching only NEWEST shares
-// 0% of its results with HELPFULNESS, which is what the Play Store page itself shows by default —
-// so a newest-only fetch looks nothing like the store listing. Walking every order and merging on
-// review id both matches what users see and reaches far more reviews than any single feed.
-const REVIEW_SORTS = [
-  { name: 'relevant', value: 1 },
-  { name: 'newest', value: 2 },
-  { name: 'rating', value: 3 },
-];
+// namespace. NEWEST is 2 in the library's public constants.
+const SORT_NEWEST = 2;
 // Requesting those pages back-to-back gets the connection torn down (ECONNRESET) after ~15 of
 // them, which is what capped deep fetches. Pausing briefly between pages sustains the full run;
 // the retry is a safety net for resets that still slip through.
@@ -37,6 +27,14 @@ const FALLBACK_COUNTRIES = ['us', 'in', 'br', 'id', 'jp', 'de', 'gb', 'ng'];
 
 type PlayApp = Awaited<ReturnType<typeof gplay.app>>;
 type PlayReview = Awaited<ReturnType<typeof gplay.reviews>>['data'][number];
+
+export type ReviewFetchStopReason = 'exhausted' | 'limit' | 'timeout' | 'partial-error';
+
+export interface ReviewFetchOutcome {
+  reviewCount: number;
+  complete: boolean;
+  stopReason: ReviewFetchStopReason;
+}
 
 function statusOf(error: unknown): number | undefined {
   return (error as { status?: number } | undefined)?.status;
@@ -241,46 +239,58 @@ export async function fetchReviews(
   // `batch` carries only the reviews new to this page, so a consumer can stream results out as
   // they land instead of waiting for the whole run to finish
   onProgress?: (count: number, batch: Review[]) => void,
-): Promise<Review[]> {
+): Promise<ReviewFetchOutcome> {
   const byId = new Map<string, Review>();
   const limit = env.maxReviews > 0 ? env.maxReviews : Infinity;
   const deadline = env.fetchTimeoutMs > 0 ? Date.now() + env.fetchTimeoutMs : Infinity;
-  const budgetSpent = () => byId.size >= limit || Date.now() >= deadline;
+  const seenTokens = new Set<string>();
+  let token: string | undefined;
 
-  const walkSort = async (sort: number): Promise<void> => {
-    let token: string | undefined;
-
+  try {
     for (;;) {
-      const page = await fetchReviewPage(packageName, lang, country, sort, token, deadline);
+      if (Date.now() >= deadline) {
+        return { reviewCount: byId.size, complete: false, stopReason: 'timeout' };
+      }
 
+      const page = await fetchReviewPage(packageName, lang, country, SORT_NEWEST, token, deadline);
       const batch: Review[] = [];
+
       for (const item of page.data) {
         if (byId.has(item.id)) continue;
         const review = toReview(item, lang);
         byId.set(item.id, review);
         batch.push(review);
+        if (byId.size >= limit) break;
+      }
+
+      onProgress?.(byId.size, batch);
+
+      // An empty continuation page is Google Play's normal end-of-results signal. Treat it as
+      // exhaustion even if the response happens to repeat the previous token.
+      if (page.data.length === 0 || !page.nextPaginationToken) {
+        return { reviewCount: byId.size, complete: true, stopReason: 'exhausted' };
+      }
+      if (byId.size >= limit) {
+        return { reviewCount: byId.size, complete: false, stopReason: 'limit' };
       }
 
       token = page.nextPaginationToken;
-      onProgress?.(byId.size, batch);
+      // A repeated cursor would otherwise loop forever and keep returning the same page.
+      if (seenTokens.has(token)) {
+        return { reviewCount: byId.size, complete: false, stopReason: 'partial-error' };
+      }
+      seenTokens.add(token);
 
-      if (!token || budgetSpent()) return;
+      if (Date.now() + PAGE_DELAY_MS >= deadline) {
+        return { reviewCount: byId.size, complete: false, stopReason: 'timeout' };
+      }
       await sleep(PAGE_DELAY_MS);
     }
-  };
-
-  // The sort feeds are independent pagination chains, so walking them at the same time fits about
-  // 30% more reviews into the same wall clock. It is not 3x: Google throttles on total request
-  // rate, and dropping the per-chain delay to zero gets every request rejected outright — the
-  // delay is what keeps the whole thing alive, so it stays even when running concurrently.
-  const outcomes = await Promise.allSettled(REVIEW_SORTS.map(({ value }) => walkSort(value)));
-
-  // one feed running dry shouldn't lose what the others produced; only a total washout is an error
-  if (byId.size === 0) {
-    const failed = outcomes.find((outcome) => outcome.status === 'rejected');
-    throw toAppError(failed?.reason ?? new Error('Google Play returned no reviews for this app.'));
+  } catch (error) {
+    // Preserve useful pages when a deep pagination request eventually gets throttled or reset.
+    // The caller records the result as partial, so the next visit backfills instead of mistaking
+    // it for a complete corpus. An initial-page failure still surfaces as a real request failure.
+    if (byId.size === 0) throw toAppError(error);
+    return { reviewCount: byId.size, complete: false, stopReason: 'partial-error' };
   }
-
-  const collected = [...byId.values()];
-  return limit === Infinity ? collected : collected.slice(0, limit);
 }

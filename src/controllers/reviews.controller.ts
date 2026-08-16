@@ -41,15 +41,23 @@ export function streamReviews(req: Request, res: Response): void {
     }
   };
 
+  const enqueue = (batch: unknown[]) => {
+    // Replayed caches can contain 100k+ reviews. Spreading that whole array into push exceeds the
+    // JavaScript argument limit, so copy at most one wire chunk at a time.
+    for (let offset = 0; offset < batch.length; ) {
+      const take = Math.min(STREAM_CHUNK - pending.length, batch.length - offset);
+      pending.push(...batch.slice(offset, offset + take));
+      offset += take;
+      if (pending.length >= STREAM_CHUNK) flush();
+    }
+  };
+
   const unsubscribe = subscribe(job, {
     onStage: (stage, message, progress, reviewCount) => {
       channel.send('stage', { stage, message, progress: Math.round(progress), reviewCount });
     },
     onApp: (app) => channel.send('app', app),
-    onReviews: (batch) => {
-      pending.push(...batch);
-      if (pending.length >= STREAM_CHUNK) flush();
-    },
+    onReviews: enqueue,
     onAnalytics: (analytics) => {
       // reviews must land before the analytics computed from them, or the client renders charts
       // that disagree with the list underneath

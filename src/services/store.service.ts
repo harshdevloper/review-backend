@@ -10,14 +10,33 @@ export interface StoredApp {
   app: AppDetails;
   syncedAt: string;
   reviewCount: number;
+  reviewCountry: string | null;
+  reviewsComplete: boolean;
+  reviewStopReason: string | null;
+}
+
+export interface ReviewSyncState {
+  country: string;
+  complete: boolean;
+  stopReason: string;
 }
 
 export async function loadApp(packageName: string): Promise<StoredApp | null> {
   if (!isStoreEnabled()) return null;
 
-  const { rows } = await getPool().query<{ details: AppDetails; synced_at: Date; review_count: string }>(
+  const { rows } = await getPool().query<{
+    details: AppDetails;
+    synced_at: Date;
+    review_count: string;
+    review_country: string | null;
+    reviews_complete: boolean;
+    review_stop_reason: string | null;
+  }>(
     `SELECT a.details,
             a.synced_at,
+            a.review_country,
+            a.reviews_complete,
+            a.review_stop_reason,
             (SELECT count(*) FROM reviews r WHERE r.package_name = a.package_name) AS review_count
        FROM apps a
       WHERE a.package_name = $1`,
@@ -26,7 +45,14 @@ export async function loadApp(packageName: string): Promise<StoredApp | null> {
 
   const row = rows[0];
   if (!row) return null;
-  return { app: row.details, syncedAt: row.synced_at.toISOString(), reviewCount: Number(row.review_count) };
+  return {
+    app: row.details,
+    syncedAt: row.synced_at.toISOString(),
+    reviewCount: Number(row.review_count),
+    reviewCountry: row.review_country,
+    reviewsComplete: row.reviews_complete,
+    reviewStopReason: row.review_stop_reason,
+  };
 }
 
 export async function loadReviews(packageName: string): Promise<Review[]> {
@@ -41,19 +67,24 @@ export async function loadReviews(packageName: string): Promise<Review[]> {
   return rows.map((row) => row.data);
 }
 
-export async function saveApp(packageName: string, app: AppDetails): Promise<void> {
+export async function saveApp(packageName: string, app: AppDetails, sync?: ReviewSyncState): Promise<void> {
   if (!isStoreEnabled()) return;
 
   await getPool().query(
-    `INSERT INTO apps (package_name, details, synced_at)
-          VALUES ($1, $2, now())
+    `INSERT INTO apps (
+       package_name, details, synced_at, review_country, reviews_complete, review_stop_reason
+     ) VALUES ($1, $2, now(), $3, COALESCE($4::boolean, false), $5)
      ON CONFLICT (package_name)
-       DO UPDATE SET details = EXCLUDED.details, synced_at = now()`,
-    [packageName, JSON.stringify(app)],
+       DO UPDATE SET details = EXCLUDED.details,
+                     synced_at = now(),
+                     review_country = COALESCE(EXCLUDED.review_country, apps.review_country),
+                     reviews_complete = COALESCE($4::boolean, apps.reviews_complete),
+                     review_stop_reason = COALESCE(EXCLUDED.review_stop_reason, apps.review_stop_reason)`,
+    [packageName, JSON.stringify(app), sync?.country ?? null, sync?.complete ?? null, sync?.stopReason ?? null],
   );
 }
 
-/** Bulk upsert. Returns how many rows were genuinely new, which is what "found N new reviews" means. */
+/** Bulk upsert. Existing rows are refreshed too, because users can edit reviews and developers reply later. */
 export async function saveReviews(packageName: string, reviews: Review[]): Promise<number> {
   if (!isStoreEnabled() || reviews.length === 0) return 0;
 
@@ -72,7 +103,8 @@ export async function saveReviews(packageName: string, reviews: Review[]): Promi
     const { rowCount } = await pool.query(
       `INSERT INTO reviews (package_name, id, posted_at, data)
        SELECT $1, * FROM UNNEST($2::text[], $3::timestamptz[], $4::jsonb[])
-       ON CONFLICT (package_name, id) DO NOTHING`,
+       ON CONFLICT (package_name, id)
+       DO UPDATE SET posted_at = EXCLUDED.posted_at, data = EXCLUDED.data`,
       [packageName, ids, dates, payloads],
     );
     inserted += rowCount ?? 0;
