@@ -5,10 +5,17 @@ import { getPool, isStoreEnabled } from './pool.js';
 // out because it is the only field the queries sort or filter on.
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS apps (
-  package_name TEXT PRIMARY KEY,
-  details      JSONB       NOT NULL,
-  synced_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+  package_name       TEXT PRIMARY KEY,
+  details            JSONB       NOT NULL,
+  synced_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+  review_country     TEXT,
+  reviews_complete   BOOLEAN     NOT NULL DEFAULT false,
+  review_stop_reason TEXT
 );
+
+ALTER TABLE apps ADD COLUMN IF NOT EXISTS review_country TEXT;
+ALTER TABLE apps ADD COLUMN IF NOT EXISTS reviews_complete BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE apps ADD COLUMN IF NOT EXISTS review_stop_reason TEXT;
 
 CREATE TABLE IF NOT EXISTS reviews (
   package_name TEXT        NOT NULL REFERENCES apps(package_name) ON DELETE CASCADE,

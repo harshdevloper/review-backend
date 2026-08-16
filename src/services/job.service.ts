@@ -4,10 +4,11 @@ import { fetchAppDetails, fetchReviews, syncNewReviews } from './playScraper.ser
 import { computeAnalytics } from './analytics.service.js';
 import { setCachedResult, getCachedResult } from './cache.service.js';
 import { isStoreEnabled } from '../db/pool.js';
-import { loadApp, loadReviews, saveApp, saveReviews, findUnknownIds } from './store.service.js';
+import { loadApp, loadReviews, saveApp, saveReviews } from './store.service.js';
 import { AppError, toAppError } from '../utils/errors.js';
 import type { AppDetails } from '../types/app.types.js';
 import type { Analytics, Review, ReviewFetchResult } from '../types/review.types.js';
+import type { ReviewFetchStopReason } from './playScraper.service.js';
 
 export type JobStatus = 'running' | 'complete' | 'error';
 export type StageName = 'connecting' | 'app-details' | 'downloading-reviews' | 'analytics' | 'preparing';
@@ -28,6 +29,9 @@ interface Job {
   message: string;
   progress: number;
   error: JobError | null;
+  reviewCountry: string;
+  reviewsComplete: boolean;
+  reviewStopReason: ReviewFetchStopReason;
   startedAt: number;
   events: EventEmitter;
 }
@@ -89,15 +93,43 @@ function toJobError(error: unknown): JobError {
   return { code: appError.code, message: appError.message, suggestion: appError.suggestion };
 }
 
+function reviewTime(review: Review): number {
+  const time = new Date(review.date).getTime();
+  return Number.isNaN(time) ? -Infinity : time;
+}
+
+function sortNewestFirst(reviews: Review[]): Review[] {
+  return reviews.sort((a, b) => reviewTime(b) - reviewTime(a) || a.id.localeCompare(b.id));
+}
+
+function emitStage(job: Job, stage: StageName, message: string, progress: number): void {
+  job.stage = stage;
+  job.message = message;
+  job.progress = progress;
+  job.events.emit('stage', stage, message, progress, job.reviews.length);
+}
+
 // The cache write is awaited before `complete` goes out: that event is the client's cue to GET the
 // result, and racing it against an unfinished write would answer NOT_CACHED.
 async function finish(job: Job, packageName: string): Promise<void> {
+  sortNewestFirst(job.reviews);
+  await saveApp(packageName, job.app!, {
+    country: job.reviewCountry,
+    complete: job.reviewsComplete,
+    stopReason: job.reviewStopReason,
+  }).catch((e: Error) => console.error('[db] saveApp:', e.message));
+
   const result: ReviewFetchResult = {
     packageName,
     app: job.app!,
     reviews: job.reviews,
     analytics: job.analytics!,
     fetchedAt: new Date().toISOString(),
+    reviewCollection: {
+      country: job.reviewCountry,
+      complete: job.reviewsComplete,
+      stopReason: job.reviewStopReason,
+    },
   };
   await setCachedResult(packageName, result);
   job.status = 'complete';
@@ -113,33 +145,78 @@ async function finish(job: Job, packageName: string): Promise<void> {
 async function catchUp(job: Job, packageName: string, lang: string, country: string): Promise<number> {
   const known = new Set(job.reviews.map((review) => review.id));
 
-  try {
-    const { country: resolvedCountry } = await fetchAppDetails(packageName, lang, country);
-    const fresh = await syncNewReviews(
-      packageName,
-      lang,
-      resolvedCountry,
-      async (ids) => new Set(ids.filter((id) => !known.has(id))),
-      (batch) => {
-        for (const review of batch) known.add(review.id);
-        job.reviews = batch.concat(job.reviews);
-        job.events.emit('reviews', batch);
-      },
-    );
+  const { app, country: resolvedCountry } = await fetchAppDetails(packageName, lang, country);
+  job.app = app;
+  job.reviewCountry = resolvedCountry;
+  job.events.emit('app', app);
 
-    if (fresh.length > 0) {
-      job.analytics = computeAnalytics(job.reviews);
-      job.events.emit('analytics', job.analytics);
+  const fresh = await syncNewReviews(
+    packageName,
+    lang,
+    resolvedCountry,
+    async (ids) => new Set(ids.filter((id) => !known.has(id))),
+    (batch) => {
+      for (const review of batch) known.add(review.id);
+      job.reviews = batch.concat(job.reviews);
+      job.events.emit('reviews', batch);
+    },
+  );
+
+  if (fresh.length > 0) {
+    job.analytics = computeAnalytics(job.reviews);
+    job.events.emit('analytics', job.analytics);
+    if (isStoreEnabled()) {
+      await saveReviews(packageName, fresh).catch((e: Error) => console.error('[db] save:', e.message));
+    }
+  }
+  return fresh.length;
+}
+
+/**
+ * Old versions cached only the first minute of a scrape and then treated those rows as final.
+ * Walk the complete NEWEST chain and merge unknown ids so those partial caches heal themselves.
+ */
+async function backfillHistory(job: Job, packageName: string, lang: string): Promise<void> {
+  const known = new Set(job.reviews.map((review) => review.id));
+  const pendingWrites: Promise<unknown>[] = [];
+  let lastAnalyticsAt = 0;
+
+  emitStage(
+    job,
+    'downloading-reviews',
+    `Completing review history... (${job.reviews.length.toLocaleString()} stored)`,
+    35,
+  );
+
+  const outcome = await fetchReviews(packageName, lang, job.reviewCountry, (scannedCount, batch) => {
+    const unknown = batch.filter((review) => !known.has(review.id));
+    if (unknown.length > 0) {
+      for (const review of unknown) known.add(review.id);
+      job.reviews.push(...unknown);
+      job.events.emit('reviews', unknown);
       if (isStoreEnabled()) {
-        await saveReviews(packageName, fresh).catch((e: Error) => console.error('[db] save:', e.message));
+        pendingWrites.push(saveReviews(packageName, unknown).catch((e: Error) => console.error('[db] save:', e.message)));
       }
     }
-    return fresh.length;
-  } catch (error) {
-    // a failed catch-up must never take down a dashboard that is already serving cached reviews
-    console.error(`[sync] ${packageName}:`, (error as Error).message);
-    return 0;
-  }
+
+    const progress = 35 + (1 - Math.exp(-scannedCount / 25_000)) * 45;
+    emitStage(
+      job,
+      'downloading-reviews',
+      `Completing review history... (${job.reviews.length.toLocaleString()} collected)`,
+      progress,
+    );
+
+    if (unknown.length > 0 && Date.now() - lastAnalyticsAt >= ANALYTICS_INTERVAL_MS) {
+      lastAnalyticsAt = Date.now();
+      job.analytics = computeAnalytics(job.reviews);
+      job.events.emit('analytics', job.analytics);
+    }
+  });
+
+  await Promise.all(pendingWrites);
+  job.reviewsComplete = outcome.complete;
+  job.reviewStopReason = outcome.stopReason;
 }
 
 /**
@@ -155,6 +232,9 @@ async function serveFromStore(job: Job, packageName: string, lang: string, count
   if (!reviews) return false;
 
   job.app = stored.app;
+  job.reviewCountry = stored.reviewCountry ?? country;
+  job.reviewsComplete = stored.reviewsComplete;
+  job.reviewStopReason = (stored.reviewStopReason as ReviewFetchStopReason | null) ?? 'partial-error';
   job.events.emit('app', stored.app);
 
   job.reviews = reviews;
@@ -171,8 +251,11 @@ async function serveFromStore(job: Job, packageName: string, lang: string, count
   job.progress = 92;
   job.events.emit('stage', job.stage, job.message, job.progress, job.reviews.length);
 
-  await catchUp(job, packageName, lang, country);
-  await saveApp(packageName, job.app).catch((e: Error) => console.error('[db] saveApp:', e.message));
+  await catchUp(job, packageName, lang, job.reviewCountry);
+  if (!job.reviewsComplete) await backfillHistory(job, packageName, lang);
+
+  job.analytics = computeAnalytics(job.reviews);
+  job.events.emit('analytics', job.analytics);
 
   await finish(job, packageName);
   return true;
@@ -182,13 +265,6 @@ async function run(job: Job, rawUrl: string): Promise<void> {
   try {
     const { packageName, lang, country } = parsePlayStoreUrl(rawUrl);
 
-    const emitStage = (stage: StageName, message: string, progress: number) => {
-      job.stage = stage;
-      job.message = message;
-      job.progress = progress;
-      job.events.emit('stage', stage, message, progress, job.reviews.length);
-    };
-
     // Disk first: a previously fetched app comes back in ~50ms, which is the only path in this
     // whole pipeline that is genuinely instant. Network stores are checked only after it misses.
     const cached = getCachedResult(packageName);
@@ -196,37 +272,48 @@ async function run(job: Job, rawUrl: string): Promise<void> {
       job.app = cached.app;
       job.reviews = cached.reviews;
       job.analytics = cached.analytics;
+      job.reviewCountry = cached.reviewCollection?.country ?? country;
+      job.reviewsComplete = cached.reviewCollection?.complete ?? false;
+      job.reviewStopReason = cached.reviewCollection?.stopReason ?? 'partial-error';
       job.events.emit('app', cached.app);
       job.events.emit('reviews', cached.reviews);
       job.events.emit('analytics', cached.analytics);
 
-      emitStage('downloading-reviews', `${cached.reviews.length.toLocaleString()} cached — checking for new reviews...`, 92);
-      await catchUp(job, packageName, lang, country);
+      emitStage(job, 'downloading-reviews', `${cached.reviews.length.toLocaleString()} cached — checking for new reviews...`, 92);
+      await catchUp(job, packageName, lang, job.reviewCountry);
+      if (!job.reviewsComplete) await backfillHistory(job, packageName, lang);
+      job.analytics = computeAnalytics(job.reviews);
+      job.events.emit('analytics', job.analytics);
       await finish(job, packageName);
       return;
     }
 
     if (storeUsable()) {
-      emitStage('preparing', 'Loading stored reviews...', 60);
+      emitStage(job, 'preparing', 'Loading stored reviews...', 60);
       if (await serveFromStore(job, packageName, lang, country)) return;
     }
 
-    emitStage('connecting', 'Connecting to Google Play...', 8);
-    emitStage('app-details', 'Fetching application details...', 20);
+    emitStage(job, 'connecting', 'Connecting to Google Play...', 8);
+    emitStage(job, 'app-details', 'Fetching application details...', 20);
 
     const { app, country: resolvedCountry } = await fetchAppDetails(packageName, lang, country);
     job.app = app;
+    job.reviewCountry = resolvedCountry;
     job.events.emit('app', app);
-    await saveApp(packageName, app);
+    await saveApp(packageName, app, {
+      country: resolvedCountry,
+      complete: false,
+      stopReason: 'partial-error',
+    }).catch((e: Error) => console.error('[db] saveApp:', e.message));
 
-    emitStage('downloading-reviews', 'Downloading reviews...', 30);
+    emitStage(job, 'downloading-reviews', 'Downloading reviews (newest first)...', 30);
 
     let lastAnalyticsAt = 0;
     // persisted as they arrive, so a fetch cut short by the timeout or a restart still leaves the
     // database better off than it was
     const pendingWrites: Promise<unknown>[] = [];
 
-    await fetchReviews(packageName, lang, resolvedCountry, (count, batch) => {
+    const outcome = await fetchReviews(packageName, lang, resolvedCountry, (count, batch) => {
       if (batch.length === 0) return;
       job.reviews.push(...batch);
       job.events.emit('reviews', batch);
@@ -236,7 +323,7 @@ async function run(job: Job, rawUrl: string): Promise<void> {
 
       // with no count cap the total is unknown, so ease toward the end of the 30-80 band
       const progress = 30 + (1 - Math.exp(-count / 15_000)) * 50;
-      emitStage('downloading-reviews', `Downloading reviews... (${count.toLocaleString()} fetched)`, progress);
+      emitStage(job, 'downloading-reviews', `Downloading reviews... (${count.toLocaleString()} fetched)`, progress);
 
       // refreshing analytics mid-flight is what lets the dashboard render charts before the
       // fetch finishes; throttled so a long run doesn't spend all its time recomputing
@@ -246,12 +333,14 @@ async function run(job: Job, rawUrl: string): Promise<void> {
         job.events.emit('analytics', job.analytics);
       }
     });
+    job.reviewsComplete = outcome.complete;
+    job.reviewStopReason = outcome.stopReason;
 
-    emitStage('analytics', 'Generating analytics...', 88);
+    emitStage(job, 'analytics', 'Generating analytics...', 88);
     job.analytics = computeAnalytics(job.reviews);
     job.events.emit('analytics', job.analytics);
 
-    emitStage('preparing', 'Preparing dashboard...', 96);
+    emitStage(job, 'preparing', 'Preparing dashboard...', 96);
     await Promise.all(pendingWrites);
 
     await finish(job, packageName);
@@ -287,6 +376,9 @@ export function startJob(rawUrl: string): Job {
     message: 'Connecting to Google Play...',
     progress: 4,
     error: null,
+    reviewCountry: 'us',
+    reviewsComplete: false,
+    reviewStopReason: 'partial-error',
     startedAt: Date.now(),
     // one listener per connected client; the default cap of 10 would warn on a busy app
     events: new EventEmitter().setMaxListeners(0),

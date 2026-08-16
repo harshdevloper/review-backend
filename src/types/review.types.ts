@@ -69,4 +69,9 @@ export interface ReviewFetchResult {
   reviews: Review[];
   analytics: Analytics;
   fetchedAt: string;
+  reviewCollection?: {
+    country: string;
+    complete: boolean;
+    stopReason: 'exhausted' | 'limit' | 'timeout' | 'partial-error';
+  };
 }

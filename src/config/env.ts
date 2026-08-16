@@ -26,8 +26,7 @@ export const env = {
   databaseUrl: process.env.DATABASE_URL ?? '',
   // 0 = no cap: keep paginating every sort order until Google stops handing out pages.
   maxReviews: Number(process.env.MAX_REVIEWS ?? 0),
-  // With no count cap the fetch is bounded by this wall clock instead. One minute lands ~18k
-  // reviews spanning years of history; past that Google's throttling makes each extra minute buy
-  // steadily less. On expiry the reviews collected so far are kept. 0 disables it.
-  fetchTimeoutMs: Number(process.env.FETCH_TIMEOUT_MINUTES ?? 1) * 60_000,
+  // Optional safety budget. The default is deliberately unlimited: a non-zero timeout produces a
+  // partial corpus and is reported as such, while 0 walks Google's NEWEST cursor to exhaustion.
+  fetchTimeoutMs: Number(process.env.FETCH_TIMEOUT_MINUTES ?? 0) * 60_000,
 };
